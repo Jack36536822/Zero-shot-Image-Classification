@@ -15,6 +15,10 @@ from typing import List, Dict, Any, Optional
 import sys
 from pathlib import Path
 import logging
+from time import monotonic
+import av
+import cv2
+from streamlit_webrtc import webrtc_streamer
 
 # Add src to path
 sys.path.append(str(Path(__file__).parent.parent))
@@ -179,14 +183,16 @@ def main():
     
     with col1:
         st.header("📤 Upload Image")
-        
-        # Image upload
-        uploaded_file = st.file_uploader(
-            "Choose an image file",
-            type=['jpg', 'jpeg', 'png', 'bmp', 'tiff'],
-            help="Upload an image to classify"
-        )
-        
+
+        image_source = st.radio("Image source", ["Upload", "Live Camera"])
+        uploaded_file = None
+
+        if image_source == "Upload":
+            uploaded_file = st.file_uploader(
+                "Choose an image file",
+                type=["jpg", "jpeg", "png", "bmp", "tiff"],
+            )
+
         if uploaded_file is not None:
             # Display uploaded image
             image = Image.open(uploaded_file).convert('RGB')
@@ -243,7 +249,47 @@ def main():
             st.write("**Selected Labels:**")
             for i, label in enumerate(labels, 1):
                 st.write(f"{i}. {label}")
-    
+
+    if image_source == "Live Camera":
+        if len(labels) < 2:
+            st.info("Enter at least two candidate labels to start the camera.")
+        else:
+            camera_labels = list(labels)
+            last_prediction_at = float("-inf")
+            overlay = "Waiting for prediction..."
+
+            def classify_camera_frame(frame):
+                nonlocal last_prediction_at, overlay
+
+                pixels = frame.to_ndarray(format="bgr24").copy()
+                now = monotonic()
+
+                if now - last_prediction_at >= 1.0:
+                    last_prediction_at = now
+                    rgb = cv2.cvtColor(pixels, cv2.COLOR_BGR2RGB)
+
+                    with torch.inference_mode():
+                        prediction, scores = model.classify(
+                            Image.fromarray(rgb), camera_labels, return_probs=True
+                        )
+
+                    overlay = prediction
+
+                pixels = cv2.flip(pixels, 1)  # Mirror the camera
+                
+                cv2.putText(
+                    pixels, overlay, (12, 32),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2,
+                )
+                return av.VideoFrame.from_ndarray(pixels, format="bgr24")
+
+            webrtc_streamer(
+                key="live-classifier",
+                video_frame_callback=classify_camera_frame,
+                media_stream_constraints={"video": True, "audio": False},
+                async_processing=False,
+            )
+
     # Classification
     if uploaded_file is not None and labels:
         st.header("🔍 Classification Results")
@@ -264,9 +310,9 @@ def main():
                     st.metric("Confidence", f"{confidence:.3f}")
                 
                 with col3:
-                    top3_conf = torch.topk(probabilities, 3)[0].sum().item()
-                    st.metric("Top-3 Confidence", f"{top3_conf:.3f}")
-                
+                    confidence_k = min(3, len(labels))
+                    top_confidence = torch.topk(probabilities, confidence_k).values.sum().item()
+                    st.metric(f"Top-{confidence_k} Confidence", f"{top_confidence:.3f}")
                 # Detailed results
                 st.subheader("📊 Detailed Results")
                 
